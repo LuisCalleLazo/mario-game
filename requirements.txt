@@ -1,0 +1,41 @@
+# ================================================================
+# requirements.txt — Mario RL Platform
+# Python 3.11 | PyTorch 2.x | CUDA 12.x (RTX 4060 sm_89)
+#
+# VERSIONES EXACTAS PROBADAS — no cambiar sin revisar compatibilidad
+# ================================================================
+
+# ── Web framework ─────────────────────────────────────────────
+flask==3.0.3
+flask-socketio==5.3.6
+flask-cors==4.0.1
+gevent==24.2.1
+gevent-websocket==0.10.1
+
+# ── RL stack ──────────────────────────────────────────────────
+# SB3 2.3.x requiere gymnasium>=0.26,<1.0
+# gymnasium 0.29.1 tiene wrappers.monitoring. NO usar gymnasium>=1.0
+stable-baselines3==2.3.2
+gymnasium==0.29.1
+
+# ── Adaptador gym->gymnasium ───────────────────────────────────
+# gym-super-mario-bros usa OpenAI gym 0.26
+# shimmy[gym-v21] convierte gym->gymnasium para SB3 2.x
+gym==0.26.2
+shimmy[gym-v21]==0.2.1
+gym-super-mario-bros==7.4.0
+nes-py==8.2.1
+
+# ── Numpy (gymnasium 0.29 requiere <2.0) ──────────────────────
+numpy==1.26.4
+
+# ── Imagen / video ────────────────────────────────────────────
+opencv-python-headless==4.9.0.80
+imageio==2.34.1
+
+# ── Utils ─────────────────────────────────────────────────────
+tensorboard==2.16.2
+pandas==2.2.2
+matplotlib==3.9.0
+requests==2.32.3
+python-dotenv==1.0.1

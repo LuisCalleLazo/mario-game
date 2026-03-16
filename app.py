@@ -39,7 +39,7 @@ from trainer import (
 app = Flask(__name__)
 app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", "mario-secret-42")
 CORS(app, resources={r"/*": {"origins": "*"}})
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading", path="/ws/socket.io" )
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading", path="/stream/events")
 
 # ── Estado global ─────────────────────────────────────────────────────────────
 _jobs: dict = load_jobs_from_disk()       # carga jobs previos del disco

@@ -22,6 +22,8 @@ WebSocket (namespace /ws):
 
 import os
 import uuid
+import json
+import threading
 from pathlib import Path
 from datetime import datetime
 
@@ -39,7 +41,7 @@ from trainer import (
 app = Flask(__name__)
 app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", "mario-secret-42")
 CORS(app, resources={r"/*": {"origins": "*"}})
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading", path="/stream/events")
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
 
 # ── Estado global ─────────────────────────────────────────────────────────────
 _jobs: dict = load_jobs_from_disk()       # carga jobs previos del disco
@@ -88,22 +90,32 @@ def start_training():
     job_id = str(uuid.uuid4())
     config["job_id"] = job_id
 
-    # Registro inicial
+    # Registro inicial — guardamos TODOS los hiperparámetros
     _jobs[job_id] = {
-        "job_id":          job_id,
-        "status":          "queued",
-        "world":           world,
-        "level":           level,
-        "action_set":      config.get("action_set", "SIMPLE"),
-        "total_timesteps": int(config.get("total_timesteps", 100_000)),
-        "created_at":      datetime.now().isoformat(),
-        "progress":        0.0,
-        "timestep":        0,
-        "mean_reward":     0.0,
-        "eta_sec":         None,
-        "device":          config.get("device_override", "auto"),
-        "model_path":      None,
-        "message":         "En cola",
+        "job_id":           job_id,
+        "status":           "queued",
+        "world":            world,
+        "level":            level,
+        "action_set":       config.get("action_set", "SIMPLE"),
+        "total_timesteps":  int(config.get("total_timesteps", 100_000)),
+        "learning_rate":    float(config.get("learning_rate", 3e-4)),
+        "n_steps":          int(config.get("n_steps", 2048)),
+        "batch_size":       int(config.get("batch_size", 64)),
+        "n_epochs":         int(config.get("n_epochs", 10)),
+        "gamma":            float(config.get("gamma", 0.99)),
+        "n_stack":          int(config.get("n_stack", 4)),
+        "n_skip":           int(config.get("n_skip", 4)),
+        "n_envs":           int(config.get("n_envs", 1)),
+        "checkpoint_freq":  int(config.get("checkpoint_freq", 10_000)),
+        "resume_from":      config.get("resume_from", ""),
+        "device":           config.get("device_override", "auto"),
+        "created_at":       datetime.now().isoformat(),
+        "progress":         0.0,
+        "timestep":         0,
+        "mean_reward":      0.0,
+        "eta_sec":          None,
+        "model_path":       None,
+        "message":          "En cola",
     }
     save_jobs_to_disk(_jobs)
 
@@ -336,10 +348,4 @@ def ws_connect():
 # ══════════════════════════════════════════════════════════════════════════════
 if __name__ == "__main__":
     print(f"[App] Jobs cargados desde disco: {len(_jobs)}")
-    socketio.run(
-        app,
-        host="0.0.0.0",
-        port=5000,
-        debug=False,
-        allow_unsafe_werkzeug=True
-    )
+    socketio.run(app, host="0.0.0.0", port=5000, debug=False)

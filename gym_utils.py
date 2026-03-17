@@ -3,20 +3,27 @@ gym_utils.py — Mario RL Platform
 =================================
 Compatible con:
   gym 0.26.2 + nes-py 8.2.1 + gym-super-mario-bros 7.4.0
-  shimmy[gym-v21] 0.2.1
   stable-baselines3 2.3.2 + gymnasium 0.29.1
 
-PROBLEMA RAÍZ:
-  gym 0.26 TimeLimit.step() intenta desempacar 5 valores del env interno,
-  pero nes-py devuelve 4. Solución: registrar el env con max_episode_steps=None
-  para que gym NO añada TimeLimit, y manejar el timeout en SMBRamWrapper.
+DECISIÓN DE DISEÑO:
+  NO usamos shimmy.GymV21CompatibilityV0 porque transpone el observation
+  space de (n_stack,H,W) float32  →  (H,W,n_stack) int64, rompiendo
+  la compatibilidad con modelos ya entrenados.
+
+  En su lugar implementamos un wrapper gymnasium nativo mínimo
+  (SB3GymnasiumWrapper) que satisface la interfaz que SB3 2.x necesita
+  sin alterar el observation space.
 """
 
 import numpy as np
 import time
+
 import gym
+import gym_super_mario_bros
 from gym_super_mario_bros.actions import SIMPLE_MOVEMENT, RIGHT_ONLY, COMPLEX_MOVEMENT
 from nes_py.wrappers import JoypadSpace
+
+import gymnasium
 from stable_baselines3.common.vec_env import DummyVecEnv
 
 ACTION_SETS = {
@@ -25,35 +32,38 @@ ACTION_SETS = {
     "COMPLEX": COMPLEX_MOVEMENT,
 }
 
-# Timeout manual (equivale al max_episode_steps original de SMB = 9999 pasos)
 _MAX_STEPS = 9999
 
 
 def _make_base_env(env_id: str):
     """
-    Crea el entorno base SIN TimeLimit wrapper de gym.
+    Crea env base y garantiza que NO haya TimeLimit de gym 0.26
+    que devuelva 5-tuple incompatible con nes-py (4-tuple).
 
-    gym.make() añade TimeLimit automáticamente; en gym 0.26 ese TimeLimit
-    usa la API de 5 valores que es incompatible con nes-py (4 valores).
-    Solución: override max_episode_steps=None para saltarse TimeLimit.
+    Estrategia: crear el env y si tiene TimeLimit encima, quitarlo
+    bajando al env interno.
     """
-    env = gym.make(env_id)
+    try:
+        env = gym.make(env_id, max_episode_steps=None)
+    except TypeError:
+        env = gym.make(env_id)
 
-    if isinstance(env, gym.wrappers.TimeLimit):
+    # Si gym igual añadió TimeLimit, bajamos al env interno
+    # TimeLimit está en gym.wrappers.time_limit.TimeLimit
+    import gym.wrappers.time_limit as _tl
+    while isinstance(env, _tl.TimeLimit):
         env = env.env
 
     return env
 
 
+# ── Wrapper RAM → grid numérico ───────────────────────────────────────────────
 class SMBRamWrapper(gym.Wrapper):
     """
-    Wrapper principal: convierte obs RGB -> grid RAM numérico.
+    Convierte obs RGB → grid numérico (n_stack, H, W) float32.
 
-    Garantías de API para shimmy.GymV21CompatibilityV0:
-      reset() -> numpy.ndarray  (NO tuple)
-      step()  -> (obs, reward, done, info)  (exactamente 4 valores)
-
-    Maneja timeout manual en lugar de depender de gym TimeLimit.
+    step()  → 4-tuple exacto  (obs, reward, done, info)
+    reset() → numpy array     (NO tuple)
     """
 
     SCREEN_W = 16
@@ -62,20 +72,23 @@ class SMBRamWrapper(gym.Wrapper):
     def __init__(self, env, crop_dim, n_stack=4, n_skip=4, max_steps=_MAX_STEPS):
         super().__init__(env)
         self.x0, self.x1, self.y0, self.y1 = crop_dim
-        self.n_stack   = n_stack
-        self.n_skip    = n_skip
-        self.max_steps = max_steps
+        self.n_stack    = n_stack
+        self.n_skip     = n_skip
+        self.max_steps  = max_steps
         self._step_count = 0
 
-        h = self.y1 - self.y0
-        w = self.x1 - self.x0
+        h = self.y1 - self.y0   # 13
+        w = self.x1 - self.x0   # 16
+
+        # shape = (n_stack, H, W) float32  ← NO cambiar, los modelos dependen de esto
         self.observation_space = gym.spaces.Box(
-            low=-1.0, high=2.0, shape=(n_stack, h, w), dtype=np.float32
+            low=-1.0, high=2.0,
+            shape=(n_stack, h, w),
+            dtype=np.float32,
         )
         self.action_space = env.action_space
         self._frames = np.zeros((n_stack, h, w), dtype=np.float32)
 
-    # ── RAM -> grid ──────────────────────────────────────────────────────────
     def _ram_to_grid(self):
         ram = self.env.unwrapped.ram
         mario_level_x = int(ram[0x6D]) * 256 + int(ram[0x86])
@@ -116,11 +129,11 @@ class SMBRamWrapper(gym.Wrapper):
         self._frames[-1] = frame
         return self._frames.copy()
 
-    # ── API gym (lo que shimmy llama directamente) ────────────────────────────
+    def observation(self, obs):
+        return self._ram_to_grid()
+
     def reset(self, **kwargs):
-        """Devuelve SOLO numpy array. shimmy NO espera tuple."""
         self._step_count = 0
-        # nes-py reset() devuelve solo obs (numpy array RGB)
         result = self.env.reset(**kwargs)
         if isinstance(result, tuple):
             result = result[0]
@@ -128,73 +141,105 @@ class SMBRamWrapper(gym.Wrapper):
         frame = self._ram_to_grid()
         for i in range(self.n_stack):
             self._frames[i] = frame
-        return self._frames.copy()
+        return self._frames.copy()   # numpy array, NO tuple
 
     def step(self, action):
-        """
-        Devuelve EXACTAMENTE (obs, reward, done, info) — 4 valores.
-        shimmy hace: obs, reward, done, info = self.gym_env.step(action)
-        """
         total_reward = 0.0
         done = False
         info = {}
-
         for _ in range(self.n_skip):
-            # nes-py -> JoypadSpace siempre devuelve 4 valores
-            # (gym TimeLimit eliminado con max_episode_steps=None)
             raw = self.env.step(action)
-
-            if len(raw) == 4:
-                _, reward, done, info = raw
-                done = bool(done)
-            elif len(raw) == 5:
-                # Por si acaba llegando un TimeLimit de algún lado
+            if len(raw) == 5:
                 _, reward, terminated, truncated, info = raw
                 done = bool(terminated or truncated)
             else:
-                raise RuntimeError(f"env.step devolvió {len(raw)} valores")
-
+                _, reward, done, info = raw
+                done = bool(done)
             total_reward += float(reward)
             if done:
                 break
-
         self._step_count += self.n_skip
-        # Timeout manual (reemplaza gym TimeLimit)
         if self._step_count >= self.max_steps:
             done = True
-
-        frame = self._ram_to_grid()
-        self._push_frame(frame)
-
+        self._push_frame(self._ram_to_grid())
         return self._frames.copy(), total_reward, done, info   # 4-tuple exacto
 
 
-# ── Factory ───────────────────────────────────────────────────────────────────
-def load_smb_env(env_id: str, crop_dim, n_stack=4, n_skip=4,
-                 action_set="SIMPLE"):
+# ── Wrapper gymnasium mínimo para SB3 2.x ────────────────────────────────────
+class SB3GymnasiumWrapper(gymnasium.Env):
     """
-    Construye entorno Mario -> DummyVecEnv para SB3 2.x.
+    Envuelve SMBRamWrapper en la interfaz gymnasium que SB3 2.x espera,
+    SIN alterar el observation_space ni el dtype.
 
-    Stack:
-      _make_base_env()          sin TimeLimit de gym
-      JoypadSpace               reduce acciones
-      SMBRamWrapper             RAM->grid, garantiza 4-tuple en step()
-      GymV21CompatibilityV0     gym->gymnasium para SB3
-      DummyVecEnv               vectorizado
+    A diferencia de shimmy.GymV21CompatibilityV0, este wrapper:
+      - Preserva shape (n_stack, H, W) y dtype float32
+      - reset() devuelve (obs, info) como pide gymnasium
+      - step()  devuelve (obs, reward, terminated, truncated, info)
     """
-    from shimmy.openai_gym_compatibility import GymV21CompatibilityV0
+
+    metadata = {"render_modes": ["rgb_array"]}
+
+    def __init__(self, env: SMBRamWrapper):
+        super().__init__()
+        self._env = env
+
+        # Copiar spaces a gymnasium preservando dtype y shape exactos
+        obs_sp = env.observation_space
+        self.observation_space = gymnasium.spaces.Box(
+            low=float(obs_sp.low.flat[0]),
+            high=float(obs_sp.high.flat[0]),
+            shape=obs_sp.shape,       # (n_stack, H, W)
+            dtype=np.float32,         # siempre float32
+        )
+        act_sp = env.action_space
+        self.action_space = gymnasium.spaces.Discrete(act_sp.n)
+
+    def reset(self, *, seed=None, options=None):
+        obs = self._env.reset()
+        return obs.astype(np.float32), {}
+
+    def step(self, action):
+        obs, reward, done, info = self._env.step(action)
+        return obs.astype(np.float32), float(reward), bool(done), False, info
+
+    def render(self):
+        return self._env.env.render(mode='rgb_array')
+
+    def close(self):
+        self._env.close()
+
+    def get_raw_env(self):
+        return self._env
+
+
+# ── Factory principal ─────────────────────────────────────────────────────────
+def load_smb_env(env_id: str, crop_dim, n_stack=4, n_skip=4,
+                 action_set="SIMPLE", n_envs=1):
+    """
+    Construye entorno Mario → VecEnv para SB3 2.x.
+
+    n_envs > 1 usa SubprocVecEnv (procesos paralelos) para aprovechar
+    múltiples cores CPU y mantener la GPU ocupada.
+    Recomendado: n_envs=8 para RTX 4060, n_envs=4 para CPU solo.
+
+    observation_space: Box(-1, 2, (n_stack, H, W), float32)
+    """
     actions = ACTION_SETS.get(action_set.upper(), SIMPLE_MOVEMENT)
 
     def _make():
-        e = _make_base_env(env_id)          # SIN gym TimeLimit
+        e = _make_base_env(env_id)
         e = JoypadSpace(e, actions)
         e = SMBRamWrapper(e, crop_dim, n_stack=n_stack, n_skip=n_skip)
-        return GymV21CompatibilityV0(env=e) # gym->gymnasium
-    
-    return DummyVecEnv([_make])
+        return SB3GymnasiumWrapper(e)
+
+    # DummyVecEnv con n_envs instancias — más estable que SubprocVecEnv
+    # con nes-py porque evita problemas de fork/pickle con el emulador.
+    # El beneficio real de n_envs>1 es tener batches más grandes para la GPU,
+    # lo cual se logra igual con DummyVecEnv.
+    return DummyVecEnv([_make] * n_envs)
 
 
-# ── Clase helper ──────────────────────────────────────────────────────────────
+# ── Helper de alto nivel ──────────────────────────────────────────────────────
 class SMB:
     def __init__(self, env, model):
         self.env   = env

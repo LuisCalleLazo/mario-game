@@ -26,7 +26,13 @@ from stable_baselines3.common.callbacks import BaseCallback, CheckpointCallback
 from gym_utils import load_smb_env
 
 # ── Directorios base ──────────────────────────────────────────────────────────
-BASE_DIR        = Path(os.environ.get("DATA_DIR", "./data"))
+# Si DATA_DIR apunta a /data (Docker) pero no existe o no hay permisos, usar ./data
+_raw_data_dir = os.environ.get("DATA_DIR", "./data")
+if _raw_data_dir.startswith("/") and not os.access(_raw_data_dir, os.W_OK):
+    import warnings
+    warnings.warn(f"DATA_DIR={_raw_data_dir} no tiene permisos, usando ./data")
+    _raw_data_dir = "./data"
+BASE_DIR        = Path(_raw_data_dir)
 MODELS_DIR      = BASE_DIR / "models"
 LOGS_DIR        = BASE_DIR / "logs"
 CHECKPOINTS_DIR = BASE_DIR / "checkpoints"
@@ -58,22 +64,30 @@ def save_jobs_to_disk(jobs: dict):
 # ── Callback de progreso ──────────────────────────────────────────────────────
 class ProgressCallback(BaseCallback):
     def __init__(self, total_timesteps: int, emit_fn=None,
-                 update_freq: int = 500, job_id: str = ""):
+                 update_freq: int = 500, job_id: str = "",
+                 initial_timesteps: int = 0):
         super().__init__(verbose=0)
-        self.total_timesteps = int(total_timesteps)
+        self.total_timesteps    = int(total_timesteps)   # pasos de ESTA sesión
+        self.initial_timesteps  = int(initial_timesteps) # pasos previos del modelo
         self.emit_fn    = emit_fn or (lambda d: None)
         self.update_freq = update_freq
         self.job_id     = job_id
         self.start_time = None
         self.last_mean_reward = 0.0
+        self._step_start = 0  # num_timesteps al inicio de esta sesión
 
     def _on_training_start(self):
-        self.start_time = time.time()
-        self._publish({"status": "training", "timestep": 0, "progress": 0.0})
+        self.start_time  = time.time()
+        # Guardar el num_timesteps actual para calcular progreso relativo
+        self._step_start = self.num_timesteps
+        self._publish({"status": "training", "timestep": self.initial_timesteps, "progress": 0.0})
 
     def _on_step(self) -> bool:
         if self.num_timesteps % self.update_freq == 0:
-            progress = self.num_timesteps / self.total_timesteps
+            # Pasos hechos EN ESTA SESIÓN (relativo)
+            session_steps = self.num_timesteps - self._step_start
+            progress = min(session_steps / max(self.total_timesteps, 1), 1.0)
+
             elapsed  = time.time() - self.start_time
             eta_sec  = (elapsed / max(progress, 1e-9)) * (1 - progress)
 
@@ -83,26 +97,32 @@ class ProgressCallback(BaseCallback):
                 )
 
             self._publish({
-                "status":      "training",
-                "timestep":    self.num_timesteps,
-                "total":       self.total_timesteps,
-                "progress":    round(progress, 4),
-                "elapsed_sec": round(elapsed, 1),
-                "eta_sec":     round(eta_sec, 1),
-                "mean_reward": round(self.last_mean_reward, 2),
+                "status":           "training",
+                # timestep acumulado total (prev + actual)
+                "timestep":         self.initial_timesteps + session_steps,
+                "total":            self.initial_timesteps + self.total_timesteps,
+                "session_timestep": session_steps,
+                "session_total":    self.total_timesteps,
+                "progress":         round(progress, 4),
+                "elapsed_sec":      round(elapsed, 1),
+                "eta_sec":          round(eta_sec, 1),
+                "mean_reward":      round(self.last_mean_reward, 2),
             })
         return True
 
     def _on_training_end(self):
         elapsed = time.time() - self.start_time
+        session_steps = self.num_timesteps - self._step_start
         self._publish({
-            "status":      "saving",
-            "timestep":    self.num_timesteps,
-            "total":       self.total_timesteps,
-            "progress":    1.0,
-            "elapsed_sec": round(elapsed, 1),
-            "eta_sec":     0,
-            "mean_reward": round(self.last_mean_reward, 2),
+            "status":           "saving",
+            "timestep":         self.initial_timesteps + session_steps,
+            "total":            self.initial_timesteps + self.total_timesteps,
+            "session_timestep": session_steps,
+            "session_total":    self.total_timesteps,
+            "progress":         1.0,
+            "elapsed_sec":      round(elapsed, 1),
+            "eta_sec":          0,
+            "mean_reward":      round(self.last_mean_reward, 2),
         })
 
     def _publish(self, data: dict):
@@ -165,13 +185,19 @@ class MarioTrainer:
 
     def _build_env(self):
         c = self.config
-        env_id = f"SuperMarioBros-{c.get('world',1)}-{c.get('level',1)}-v0"
+        env_id  = f"SuperMarioBros-{c.get('world',1)}-{c.get('level',1)}-v0"
+        n_envs  = int(c.get("n_envs", 1))
+        device  = c.get("_device", "cpu")
+        # En CPU limitar a 4 envs para no saturar cores
+        if device == "cpu" and n_envs > 4:
+            n_envs = 4
         return load_smb_env(
             env_id,
             self.CROP_DIM,
             n_stack=int(c.get("n_stack", 4)),
             n_skip=int(c.get("n_skip", 4)),
             action_set=c.get("action_set", "SIMPLE"),
+            n_envs=n_envs,
         )
 
     def _build_model(self, env, device: str):
@@ -179,7 +205,32 @@ class MarioTrainer:
         resume_path = c.get("resume_from", "").strip()
         if resume_path and os.path.exists(resume_path):
             print(f"[Trainer] Reanudando desde {resume_path} en {device}")
-            return PPO.load(resume_path, env=env, device=device)
+            # custom_objects evita el error de deserialización de clip_range/lr_schedule
+            # cuando el modelo fue guardado con diferente versión de Python
+            custom_objects = {
+                "clip_range": 0.2,
+                "lr_schedule": float(c.get("learning_rate", 3e-4)),
+            }
+            model = PPO.load(
+                resume_path, env=env, device=device,
+                custom_objects=custom_objects,
+            )
+            # Asignar tensorboard_log manualmente (no se guarda en el zip)
+            log_dir = str(LOGS_DIR / self.job_id)
+            os.makedirs(log_dir, exist_ok=True)
+            model.tensorboard_log = log_dir
+            return model
+
+        n_steps   = int(c.get("n_steps", 2048))
+        n_envs    = int(c.get("n_envs", 1))
+        batch_size = int(c.get("batch_size", 64))
+        # batch_size debe dividir n_steps * n_envs exactamente
+        total_steps = n_steps * n_envs
+        if total_steps % batch_size != 0:
+            # Ajustar batch_size al divisor más cercano
+            import math
+            batch_size = max(64, total_steps // (total_steps // batch_size))
+            print(f"[Trainer] batch_size ajustado a {batch_size} (n_steps*n_envs={total_steps})")
 
         return PPO(
             "MlpPolicy",
@@ -187,8 +238,8 @@ class MarioTrainer:
             device=device,
             verbose=0,
             learning_rate=float(c.get("learning_rate", 3e-4)),
-            n_steps=int(c.get("n_steps", 2048)),
-            batch_size=int(c.get("batch_size", 64)),
+            n_steps=n_steps,
+            batch_size=batch_size,
             n_epochs=int(c.get("n_epochs", 10)),
             gamma=float(c.get("gamma", 0.99)),
             tensorboard_log=str(LOGS_DIR / self.job_id),
@@ -201,6 +252,7 @@ class MarioTrainer:
             self._update_job({"status": "building", "device": device,
                               "message": f"Construyendo entorno… (device={device})"})
 
+            self.config["_device"] = device  # para que _build_env sepa el device
             env   = self._build_env()
             model = self._build_model(env, device)
 
@@ -209,11 +261,18 @@ class MarioTrainer:
             ckpt_dir  = CHECKPOINTS_DIR / self.job_id
             ckpt_dir.mkdir(parents=True, exist_ok=True)
 
+            # Detectar cuántos pasos tiene ya el modelo (si es reanudación)
+            initial_ts = 0
+            if hasattr(model, 'num_timesteps') and model.num_timesteps > 0:
+                initial_ts = int(model.num_timesteps)
+                print(f"[Trainer] Reanudando desde timestep {initial_ts:,}")
+
             progress_cb = ProgressCallback(
                 total_timesteps=total,
                 emit_fn=self._emit_and_persist,
                 update_freq=max(100, ckpt_freq // 20),
                 job_id=self.job_id,
+                initial_timesteps=initial_ts,
             )
             checkpoint_cb = CheckpointCallback(
                 save_freq=ckpt_freq,

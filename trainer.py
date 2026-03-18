@@ -166,6 +166,30 @@ class MarioTrainer:
     def stop(self):
         self._stop.set()
 
+    def force_checkpoint(self):
+        """
+        Fuerza un checkpoint en el próximo step del entrenamiento
+        escribiendo un archivo de señal que el callback detecta.
+        NO requiere reiniciar Flask ni el trainer.
+        """
+        try:
+            if not self.is_alive():
+                return False, "Entrenamiento no activo"
+            signals_dir = BASE_DIR / "signals"
+            signals_dir.mkdir(parents=True, exist_ok=True)
+            signal_file = signals_dir / f"{self.job_id}.ckpt"
+            signal_file.touch()
+            msg = "Señal de checkpoint enviada — se guardará en el próximo step"
+            print(f"[Force Checkpoint] {msg}")
+            self._emit_and_persist({
+                "job_id":  self.job_id,
+                "status":  "training",
+                "message": msg,
+            })
+            return True, str(CHECKPOINTS_DIR / self.job_id)
+        except Exception as e:
+            return False, str(e)
+
     def is_alive(self):
         return self._thread is not None and self._thread.is_alive()
 
@@ -255,6 +279,7 @@ class MarioTrainer:
             self.config["_device"] = device  # para que _build_env sepa el device
             env   = self._build_env()
             model = self._build_model(env, device)
+            self._current_model = model  # referencia para force_checkpoint()
 
             total     = int(self.config.get("total_timesteps", 100_000))
             ckpt_freq = int(self.config.get("checkpoint_freq", 10_000))
@@ -274,11 +299,63 @@ class MarioTrainer:
                 job_id=self.job_id,
                 initial_timesteps=initial_ts,
             )
-            checkpoint_cb = CheckpointCallback(
+            # job_id_ref: variable capturada por el closure del callback
+            job_id_ref = self.job_id
+            # Crear directorio de señales
+            signals_dir = BASE_DIR / "signals"
+            signals_dir.mkdir(parents=True, exist_ok=True)
+
+            # Callback propio de checkpoint — funciona correctamente en reanudación.
+            # SB3's CheckpointCallback usa n_calls que se preserva del modelo cargado,
+            # lo que hace que save_freq % n_calls nunca dispare. Este callback usa
+            # pasos de la sesión actual para disparar siempre correctamente.
+            class _SessionCheckpointCallback(BaseCallback):
+                def __init__(self, save_freq, save_path, name_prefix="ckpt"):
+                    super().__init__(verbose=0)
+                    self.save_freq    = save_freq
+                    self.save_path    = save_path
+                    self.name_prefix  = name_prefix
+                    self._session_steps = 0
+                    self._step_start    = 0
+
+                def _on_training_start(self):
+                    self._step_start = self.num_timesteps
+                    os.makedirs(self.save_path, exist_ok=True)
+
+                def _on_step(self) -> bool:
+                    self._session_steps = self.num_timesteps - self._step_start
+
+                    # ── Checkpoint automático por frecuencia ──────────────
+                    if self._session_steps > 0 and self._session_steps % self.save_freq == 0:
+                        self._save(reason="auto")
+
+                    # ── Checkpoint forzado por archivo de señal ───────────
+                    # Cualquier proceso puede crear ./data/signals/<job_id>.ckpt
+                    # y el trainer lo detecta en el próximo step sin reiniciar
+                    signal_file = os.path.join(
+                        str(BASE_DIR), "signals", f"{job_id_ref}.ckpt"
+                    )
+                    if os.path.exists(signal_file):
+                        try:
+                            os.remove(signal_file)
+                            self._save(reason="forced")
+                        except Exception:
+                            pass
+
+                    return True
+
+                def _save(self, reason="auto"):
+                    path = os.path.join(
+                        self.save_path,
+                        f"{self.name_prefix}_{reason}_{self.num_timesteps}_steps"
+                    )
+                    self.model.save(path)
+                    print(f"[Checkpoint-{reason}] {path}.zip (step {self.num_timesteps:,})")
+
+            checkpoint_cb = _SessionCheckpointCallback(
                 save_freq=ckpt_freq,
                 save_path=str(ckpt_dir),
                 name_prefix="ckpt",
-                verbose=0,
             )
 
             self._update_job({"status": "training", "message": "Entrenamiento iniciado"})

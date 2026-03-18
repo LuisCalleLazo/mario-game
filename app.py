@@ -139,6 +139,21 @@ def stop_training(job_id):
     return jsonify({"job_id": job_id, "status": "stopped"})
 
 
+@app.route("/api/train/<job_id>/checkpoint", methods=["POST"])
+def force_checkpoint(job_id):
+    """Fuerza un checkpoint inmediato sin detener el entrenamiento."""
+    trainer = _trainers.get(job_id)
+    if not trainer:
+        return jsonify({"error": "job no encontrado"}), 404
+    if not trainer.is_alive():
+        return jsonify({"error": "entrenamiento no activo"}), 400
+    ok, result = trainer.force_checkpoint()
+    if ok:
+        return jsonify({"job_id": job_id, "status": "checkpoint_saved", "path": result})
+    else:
+        return jsonify({"error": result}), 500
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # REST — Jobs
 # ══════════════════════════════════════════════════════════════════════════════
@@ -347,5 +362,7 @@ def ws_connect():
 
 # ══════════════════════════════════════════════════════════════════════════════
 if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5000))
     print(f"[App] Jobs cargados desde disco: {len(_jobs)}")
-    socketio.run(app, host="0.0.0.0", port=5000, debug=False)
+    print(f"[App] Corriendo en puerto {port}")
+    socketio.run(app, host="0.0.0.0", port=port, debug=False)
